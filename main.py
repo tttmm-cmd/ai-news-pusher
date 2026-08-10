@@ -43,8 +43,10 @@ HEADERS = {
 
 
 def fetch_hacker_news(limit: int = 30) -> list[dict]:
-    """Hacker News 热门 — 免费公开 API"""
+    """Hacker News: 热门 + 关键词搜索，双通道获取"""
     stories = []
+
+    # 通道1：热门新闻
     try:
         resp = requests.get(
             "https://hacker-news.firebaseio.com/v0/topstories.json", timeout=15
@@ -67,10 +69,32 @@ def fetch_hacker_news(limit: int = 30) -> list[dict]:
                     })
             except Exception:
                 continue
-            time.sleep(0.05)  # 礼貌限速
-
+            time.sleep(0.05)
     except Exception as e:
-        print(f"[WARN] Hacker News 获取失败: {e}")
+        print(f"[WARN] Hacker News 热门获取失败: {e}")
+
+    # 通道2：Algolia 关键词搜索（补获 Agent 相关帖子）
+    try:
+        for keyword in ["agent framework", "langgraph", "crewai", "agent tutorial"]:
+            resp = requests.get(
+                "https://hn.algolia.com/api/v1/search",
+                params={"query": keyword, "tags": "story", "hitsPerPage": 5},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            for hit in resp.json().get("hits", []):
+                title = hit.get("title", "")
+                url = hit.get("url") or f"https://news.ycombinator.com/item?id={hit.get('objectID')}"
+                if title:
+                    stories.append({
+                        "title": title,
+                        "url": url,
+                        "source": "Hacker News",
+                        "score": hit.get("points", 0),
+                    })
+            time.sleep(0.3)
+    except Exception as e:
+        print(f"[WARN] Hacker News 关键词搜索失败: {e}")
 
     return stories
 
@@ -110,11 +134,19 @@ def fetch_reddit(subreddits: list[str] = None) -> list[dict]:
 def fetch_github_trending(languages: list[str] = None) -> list[dict]:
     """GitHub 搜索 AI Agent 相关仓库 — 免费 Search API（限速 10req/min）"""
     queries = [
-        "ai agent framework",
-        "llm agent",
-        "autonomous agent",
-        "multi-agent",
-        "agentic ai",
+        # 热门 Agent 框架（按名称搜）
+        "langgraph",
+        "crewai",
+        "autogen agent",
+        "metagpt",
+        "auto-gpt",
+        # 教程和入门资源
+        "agent tutorial beginner",
+        "build ai agent from scratch",
+        "llm agent architecture",
+        # 工具/平台
+        "agentops",
+        "agent memory tool",
     ]
     repos_all = []
     seen = set()
@@ -157,7 +189,11 @@ def fetch_arxiv_agent_papers(max_results: int = 15) -> list[dict]:
     """arXiv 最新 AI Agent 论文"""
     papers = []
     try:
-        query = "all:(AI agent) OR all:(LLM agent) OR all:(autonomous agent) OR all:(multi-agent system)"
+        query = (
+            "all:(agent framework) OR all:(LLM agent) OR all:(multi-agent collaboration) "
+            "OR all:(tool use agent) OR all:(function calling agent) OR all:(agentic workflow) "
+            "OR all:(retrieval augmented agent)"
+        )
         params = {
             "search_query": query,
             "sortBy": "submittedDate",
@@ -247,39 +283,65 @@ def summarize_with_deepseek(stories: list[dict]) -> str:
     today_str = datetime.now(CST).strftime("%Y年%m月%d日")
 
     system_prompt = (
-        "你是一个专业的 AI 新闻编辑，专注于「AI Agent / 人工智能代理 / 智能体」领域。"
-        "你的任务是从大量技术新闻中筛选出与 AI Agent 最相关的内容，翻译成中文，并进行专业摘要。"
+        "你是一个贴心的 AI 学习助手，专门帮助正在学习 AI Agent 开发的新手（学了约半个月）。"
+        "你的读者了解 Python 基础，但对 Agent 框架（LangGraph、CrewAI、AutoGen 等）还不太熟。"
+        "你的任务是：从新闻中挑出对新手最有学习价值的内容，"
+        "用通俗易懂的中文解释每条新闻「说的是什么」「为什么值得关注」「能学到什么」。"
     )
 
-    user_prompt = f"""下面是今天从 Hacker News、Reddit、GitHub、arXiv 等渠道收集到的技术新闻列表。
+    user_prompt = f"""下面是今天从 Hacker News、Reddit、GitHub、arXiv 等渠道收集的技术内容。
 
 请完成以下任务：
-1. **筛选**：只保留与 AI Agent / LLM Agent / 自主代理 / 多智能体系统 / Agent 框架 / Agentic AI 强相关的新闻
-2. **去重**：同一事件的多条报道只保留一条
-3. **排序**：按重要性从高到低排序
-4. **翻译+摘要**：对每条筛选出的新闻，翻译标题、写 2-3 句中文摘要
-5. **数量**：最终保留 6-10 条最重要的新闻
 
-请严格按照以下 Markdown 格式输出（这是推送到微信的，请保持简洁）：
+1. **筛选**：优先选择以下类型的内容（按优先级排列）：
+   - 🥇 热门 Agent 框架（LangGraph/CrewAI/AutoGen/MetaGPT/Dify/Coze 等）的新版本、新功能、教程
+   - 🥈 「手把手教你搭建 Agent」「从零实现 Agent」类实战教程/博客
+   - 🥉 对新手友好的 Agent 设计模式、架构讲解
+   - 可捎带 1-2 条重大行业新闻（如 OpenAI/Anthropic 的 Agent 产品发布）
+   - ❌ 跳过纯学术论文（除非有开源代码+对新手有实战价值）
+   - ❌ 跳过纯产品营销文章
 
-# 🤖 AI Agent 每日速递 | {today_str}
+2. **去重**：同一事件只保留一条。
+
+3. **翻译+讲解**：对每条内容用中文写出：
+   - 标题（翻译成中文）
+   - 用一句话说清楚「这是什么」
+   - 用 1-2 句话说明「对正在学 Agent 开发的人有什么价值 / 能学到什么」
+
+4. **难度标签**：每条加一个标签：
+   - 🟢 新手友好（不需要先验知识）
+   - 🟡 需要基础（建议了解过 Python + LLM 基本概念）
+   - 🔴 进阶（适合深入理解原理）
+
+5. **数量**：最终保留 5-8 条。
+
+6. **末尾推荐**：从今天的内容中挑一个最适合动手的，写上「今日推荐动手」简短说明。
+
+请严格按照以下 Markdown 格式输出：
+
+# 🤖 AI Agent 学习速递 | {today_str}
 
 ---
-{{每条新闻用以下格式，数字序号}}
 
-**1. 中文标题**
-📎 来源：Hacker News
-💡 中文摘要内容，2-3句话，说清楚这个新闻讲什么、为什么重要。
+**N. 🟢 中文标题**
+📎 来源：GitHub
+📖 是什么：一句话说清楚
+💡 学习价值：1-2句话，讲清楚对新手有什么帮助
 🔗 [原文](url)
 
-**2. ...**
+...
 
 ---
 
-*📡 由 DeepSeek 自动生成 | 数据来源: Hacker News · Reddit · GitHub · arXiv*
+## 🛠 今日推荐动手
+> 从今天内容中挑一个最适合新手动手的，说明要做什么、能学到什么。
 
 ---
-以下是待筛选的新闻列表：
+
+*📡 自动生成 | 数据来源: Hacker News · Reddit · GitHub · arXiv*
+
+---
+以下是待筛选的内容列表：
 
 {news_text}"""
 
