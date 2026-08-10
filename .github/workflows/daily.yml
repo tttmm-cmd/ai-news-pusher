@@ -1,0 +1,32 @@
+name: AI Agent 每日新闻推送
+
+on:
+  schedule:
+    # 北京时间每天早上 8:30（UTC 0:30）
+    - cron: "30 0 * * *"
+  # 也支持手动触发（方便测试）
+  workflow_dispatch:
+
+jobs:
+  push-news:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 运行新闻推送
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
+          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+        run: python main.py

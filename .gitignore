@@ -1,0 +1,16 @@
+# 密钥文件 — 绝不能提交
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
