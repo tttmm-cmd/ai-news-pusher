@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 AI Agent 每日新闻推送
-多源爬取 → DeepSeek 翻译+摘要 → WxPusher 推送到微信
+多源爬取 → DeepSeek 翻译+摘要 → 邮件推送（SMTP）
+自带 URL 去重历史，避免重复推送
 
 用法:
     python main.py          # 手动运行一次
@@ -10,6 +11,7 @@ AI Agent 每日新闻推送
 """
 
 import os
+import re
 import json
 import time
 import hashlib
@@ -17,6 +19,31 @@ from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+
+
+def _load_dotenv(path: str = None):
+    """极简 .env 加载（不引入 python-dotenv）：读取 KEY=VALUE，写入环境变量（不覆盖已存在的值）"""
+    if path is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+    except Exception as e:
+        print(f"[WARN] 加载 .env 失败: {e}")
+
+
+# 先加载 .env，再读取下面的配置
+_load_dotenv()
 
 # ============================================================
 # 配置 — 全部从环境变量读取，不要硬编码密钥
@@ -26,12 +53,60 @@ DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
-WXPUSHER_APP_TOKEN = os.environ["WXPUSHER_APP_TOKEN"]
-WXPUSHER_UID = os.environ["WXPUSHER_UID"]  # 注意：是 UID_xxx 格式，不是 AT_xxx
-WXPUSHER_SEND_URL = "https://wxpusher.zjiecode.com/api/send/message"
+# SMTP 邮件配置（默认适配 QQ 邮箱）
+SMTP_HOST = os.environ.get("SMTP_HOST", "") or "smtp.qq.com"
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "") or "465")  # 465=SSL，587=STARTTLS
+SMTP_USER = os.environ.get("SMTP_USER", "").strip()           # 发件邮箱，如 xxx@qq.com
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "").strip()   # QQ 邮箱「授权码」，不是登录密码
+MAIL_TO = os.environ.get("MAIL_TO", "").strip() or SMTP_USER  # 收件人，默认发给自己
+MAIL_FROM_NAME = os.environ.get("MAIL_FROM_NAME", "AI Agent 日报")
+MAIL_SUBJECT_PREFIX = os.environ.get("MAIL_SUBJECT_PREFIX", "🤖 AI Agent 学习速递")
+
+# 去重历史：记录已推送过的 URL，避免每天推重复内容
+HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history.json")
+HISTORY_MAX = 500  # 最多保留最近 500 条
 
 # 北京时间
 CST = timezone(timedelta(hours=8))
+
+# ============================================================
+# 去重历史
+# ============================================================
+
+def load_history() -> set:
+    """读取已推送过的 URL 历史"""
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return set(data) if isinstance(data, list) else set()
+        except Exception as e:
+            print(f"[WARN] 读取历史记录失败: {e}")
+    return set()
+
+
+def save_history(urls: set) -> None:
+    """追加写入本次推送的 URL，只保留最近 HISTORY_MAX 条"""
+    existing = []
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        except Exception:
+            existing = []
+    merged = list(dict.fromkeys(list(existing) + sorted(urls)))  # 去重且保序
+    merged = merged[-HISTORY_MAX:]
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(merged, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[WARN] 保存历史记录失败: {e}")
+
+
+def extract_urls(text: str) -> set:
+    """从生成的 Markdown 里提取链接，用于记录本次实际推送的内容"""
+    return set(re.findall(r"\]\((https?://[^)\s]+)\)", text))
+
 
 # ============================================================
 # 新闻源爬取
@@ -73,12 +148,18 @@ def fetch_hacker_news(limit: int = 30) -> list[dict]:
     except Exception as e:
         print(f"[WARN] Hacker News 热门获取失败: {e}")
 
-    # 通道2：Algolia 关键词搜索（补获 Agent 相关帖子）
+    # 通道2：Algolia 关键词搜索（补获 Agent 相关帖子，只看最近 2 天）
     try:
+        recent_epoch = int(time.time()) - 2 * 86400  # 最近 48 小时
         for keyword in ["agent framework", "langgraph", "crewai", "agent tutorial"]:
             resp = requests.get(
                 "https://hn.algolia.com/api/v1/search",
-                params={"query": keyword, "tags": "story", "hitsPerPage": 5},
+                params={
+                    "query": keyword,
+                    "tags": "story",
+                    "hitsPerPage": 5,
+                    "numericFilters": f"created_at_i>{recent_epoch}",
+                },
                 timeout=15,
             )
             resp.raise_for_status()
@@ -377,32 +458,72 @@ def summarize_with_deepseek(stories: list[dict]) -> str:
 
 
 # ============================================================
-# WxPusher 推送到微信
+# 邮件推送（SMTP）
 # ============================================================
 
-def push_to_wxpusher(content: str) -> bool:
-    """通过 WxPusher 推送 Markdown 消息到微信"""
-    payload = {
-        "appToken": WXPUSHER_APP_TOKEN,
-        "content": content,
-        "contentType": 3,  # 3 = Markdown
-        "uids": [WXPUSHER_UID],
-    }
+def markdown_to_html(md: str) -> str:
+    """把摘要 Markdown 转成简易 HTML（不引入额外依赖）"""
+    import html as _html
+
+    out = []
+    for raw in md.split("\n"):
+        line = raw.rstrip()
+        if line.strip() == "---":
+            out.append("<hr>")
+        elif line.startswith("# "):
+            out.append(f"<h2>{_html.escape(line[2:])}</h2>")
+        elif line.startswith("## "):
+            out.append(f"<h3>{_html.escape(line[3:])}</h3>")
+        elif line.startswith("> "):
+            out.append(f"<blockquote>{_html.escape(line[2:])}</blockquote>")
+        elif line.strip() == "":
+            continue
+        else:
+            out.append(f"<p>{_html.escape(line)}</p>")
+    body = "\n".join(out)
+
+    # 行内格式：加粗 / 链接 / 斜体
+    body = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", body)
+    body = re.sub(r"\[(.+?)\]\((https?://[^)\s]+)\)", r'<a href="\2">\1</a>', body)
+    body = re.sub(r"\*(.+?)\*", r"<em>\1</em>", body)
+    return body
+
+
+def send_email(content: str, subject_date: str) -> bool:
+    """通过 SMTP 发送 HTML 邮件"""
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    from email.header import Header
+    from email.utils import formataddr
+
+    if not SMTP_USER or not SMTP_PASSWORD:
+        print("[ERROR] 未配置 SMTP_USER / SMTP_PASSWORD，无法发信")
+        return False
+
+    subject = f"{MAIL_SUBJECT_PREFIX} | {subject_date}"
+    html_body = markdown_to_html(content)
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = Header(subject, "utf-8")
+    msg["From"] = formataddr((str(Header(MAIL_FROM_NAME, "utf-8")), SMTP_USER))
+    msg["To"] = MAIL_TO
+    msg.attach(MIMEText(content, "plain", "utf-8"))  # 纯文本兜底
+    msg.attach(MIMEText(html_body, "html", "utf-8"))  # HTML 正文
 
     try:
-        resp = requests.post(WXPUSHER_SEND_URL, json=payload, timeout=15)
-        data = resp.json()
-        if data.get("code") == 1000:
-            print("[OK] WxPusher 推送成功")
-            return True
+        if SMTP_PORT == 465:
+            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20)
         else:
-            print(f"[ERROR] WxPusher 推送失败: {data.get('msg', '未知错误')}")
-            # 常见错误提示
-            if "uid" in str(data).lower():
-                print("[HINT] UID 可能不对，请去 WxPusher 后台「用户管理」查看正确的 UID（通常以 UID_ 开头）")
-            return False
+            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20)
+            server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.sendmail(SMTP_USER, [MAIL_TO], msg.as_string())
+        server.quit()
+        print(f"[OK] 邮件已发送到 {MAIL_TO}")
+        return True
     except Exception as e:
-        print(f"[ERROR] WxPusher 请求异常: {e}")
+        print(f"[ERROR] 邮件发送失败: {e}")
         return False
 
 
@@ -421,9 +542,17 @@ def main():
         print("[ERROR] 未获取到任何新闻，终止")
         return
 
-    # 2. DeepSeek 筛选 + 翻译 + 摘要
+    # 2. 过滤掉历史已推送过的内容
+    history = load_history()
+    fresh = [s for s in stories if s["url"] not in history]
+    print(f"[INFO] 过滤已推送历史后剩余 {len(fresh)} 条（历史 {len(history)} 条）")
+    if not fresh:
+        print("[WARN] 今日内容全部推送过，改用全部内容继续（避免空推）")
+        fresh = stories
+
+    # 3. DeepSeek 筛选 + 翻译 + 摘要
     try:
-        summary = summarize_with_deepseek(stories)
+        summary = summarize_with_deepseek(fresh)
     except Exception:
         print("[FATAL] DeepSeek 处理失败，无法继续")
         return
@@ -437,16 +566,20 @@ def main():
         print(f"[INFO] 摘要长度: {len(summary)} 字符")
     print("-" * 40 + "\n")
 
-    # 3. 推送到微信
-    success = push_to_wxpusher(summary)
+    # 4. 发送邮件（成功后才记录历史，避免发送失败却把内容标记为已发）
+    today_str = datetime.now(CST).strftime("%Y年%m月%d日")
+    success = send_email(summary, today_str)
     if success:
-        print("[DONE] News pushed to WeChat successfully!")
+        sent_urls = extract_urls(summary) or {s["url"] for s in fresh}
+        save_history(sent_urls)
+        print(f"[INFO] 已记录 {len(sent_urls)} 条链接到去重历史")
+        print("[DONE] 日报已通过邮件发送！")
     else:
-        print("[FAIL] Push failed, check config!")
-        print("[HINT] Troubleshooting:")
-        print("  1. Is AppToken correct?")
-        print("  2. Is UID correct? (should be UID_xxx format, not AT_xxx)")
-        print("  3. Did you subscribe to the WxPusher app in WeChat?")
+        print("[FAIL] 邮件发送失败，请检查 SMTP 配置！")
+        print("[HINT] 排查：")
+        print("  1. SMTP_USER / SMTP_PASSWORD 是否正确（QQ 邮箱需用「授权码」而非登录密码）")
+        print("  2. 是否已在 QQ 邮箱「设置 → 账户 → 开启 SMTP 服务」")
+        print("  3. MAIL_TO 收件人地址是否正确")
 
 
 if __name__ == "__main__":

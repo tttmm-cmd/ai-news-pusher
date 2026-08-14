@@ -7,6 +7,9 @@ on:
   # 也支持手动触发（方便测试）
   workflow_dispatch:
 
+permissions:
+  contents: write  # 允许把 history.json（去重历史）提交回仓库
+
 jobs:
   push-news:
     runs-on: ubuntu-latest
@@ -27,6 +30,25 @@ jobs:
       - name: 运行新闻推送
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
-          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
         run: python main.py
+
+      - name: 提交去重历史
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ ! -f history.json ]; then
+            echo "history.json 不存在，跳过提交"
+            exit 0
+          fi
+          git add history.json
+          if git diff --cached --quiet; then
+            echo "history.json 无变化，跳过提交"
+          else
+            git commit -m "chore: 更新去重历史"
+            git push origin HEAD:main
+          fi
