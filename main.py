@@ -50,8 +50,8 @@ _load_dotenv()
 # ============================================================
 
 DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
-DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
-DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "") or "https://api.deepseek.com/v1"
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "") or "deepseek-chat"
 
 # SMTP 邮件配置（默认适配 QQ 邮箱）
 SMTP_HOST = os.environ.get("SMTP_HOST", "") or "smtp.qq.com"
